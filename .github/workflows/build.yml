@@ -1,0 +1,146 @@
+name: build
+
+# Repo Public => GitHub Actions miễn phí không giới hạn phút.
+#
+#   1. Build bản amd64, chạy thử THẬT: LibreOffice chuyển một tệp .txt qua chính dịch vụ
+#      (kèm kiểm khóa sai -> 403, máy chủ lạ -> 400, /media, tệp giao diện). Không qua thì dừng.
+#   2. Qua thì build đa kiến trúc (cụm chạy arm64) và đẩy lên ghcr.io/<owner>/doc-viewer:<mã commit>.
+#   3. (Tuỳ chọn) Nếu repo có secret MANIFEST_REPO_TOKEN thì tự ghi tag mới vào repo manifest
+#      ci-cd-platform (apps/doc-viewer/deployment.yaml) và commit; ArgoCD tự cuốn chiếu.
+#      Không có secret thì bước này bị bỏ qua, tag mới in ở phần Summary để sửa tay.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  MANIFEST_REPOSITORY: Npham140201/ci-cd-platform
+  MANIFEST_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dựng tên image
+        id: meta
+        run: |
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner}/doc-viewer" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build bản amd64 để thử
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: doc-viewer:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Chạy thử thật (LibreOffice + dịch vụ)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hub
+          printf 'Xin chào tài liệu\n' > /tmp/hub/hello.txt
+          (cd /tmp/hub && nohup python3 -m http.server 19001 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          docker run -d --name dv --network host \
+            -e PORT=18080 -e ALLOWED_HOSTS=127.0.0.1:19001 -e VIEWER_KEY=test \
+            doc-viewer:test
+          fail() { echo "THẤT BẠI: $1"; docker logs dv || true; exit 1; }
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/healthz >/dev/null || fail "dịch vụ không lên"
+          src='http%3A%2F%2F127.0.0.1%3A19001%2Fhello.txt'
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/view?src=${src}")
+          [ "$code" = "403" ] || fail "thiếu khóa phải trả 403, nhận $code"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/view?k=test&src=http%3A%2F%2Fevil.example%2Fx.txt")
+          [ "$code" = "400" ] || fail "máy chủ lạ phải trả 400, nhận $code"
+          for asset in viewer.css image-viewer.js video-viewer.js; do
+            curl -fsS -o /dev/null "http://127.0.0.1:18080/assets/${asset}" || fail "thiếu tệp giao diện ${asset}"
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/media?src=${src}")
+          [ "$code" = "403" ] || fail "/media thiếu khóa phải trả 403, nhận $code"
+          media=$(curl -fsS -D - -o /dev/null "http://127.0.0.1:18080/media?k=test&download=1&name=hello.txt&src=${src}")
+          echo "$media" | grep -qi '^content-disposition: attachment' || fail "/media download=1 phải trả attachment"
+          page=$(curl -fsS "http://127.0.0.1:18080/view?k=test&src=${src}")
+          id=$(echo "$page" | grep -oE 'jobId="[0-9a-f]{32}"' | grep -oE '[0-9a-f]{32}' | head -1)
+          [ -n "$id" ] || fail "không lấy được mã công việc"
+          state=pending
+          for i in $(seq 1 90); do
+            state=$(curl -fsS "http://127.0.0.1:18080/status?id=${id}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["state"])')
+            [ "$state" != "pending" ] && break
+            sleep 2
+          done
+          [ "$state" = "ready" ] || fail "chuyển đổi không xong (trạng thái: $state)"
+          head=$(curl -fsS "http://127.0.0.1:18080/file/${id}" | head -c 4)
+          [ "$head" = "%PDF" ] || fail "kết quả không phải PDF"
+          echo "Chạy thử đạt: .txt -> PDF qua LibreOffice"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build đa kiến trúc và đẩy lên ghcr.io
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Cụm chạy arm64 (Oracle Ampere); amd64 thêm cho tiện test trên máy thường.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Ghi tag vào Summary
+        run: |
+          {
+            echo "### Image đã đẩy"
+            echo ""
+            echo "\`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}\`"
+            echo ""
+            echo "Sửa dòng \`image:\` trong \`apps/doc-viewer/deployment.yaml\` của repo manifest thành tag \`${{ steps.meta.outputs.tag }}\` nếu chưa có bước tự động."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cập nhật tag ở repo manifest (tùy chọn)
+        if: ${{ env.MANIFEST_TOKEN != '' }}
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --quiet "https://x-access-token:${MANIFEST_TOKEN}@github.com/${MANIFEST_REPOSITORY}.git" manifest
+          cd manifest
+          git config user.name "doc-viewer-ci"
+          git config user.email "ci@users.noreply.github.com"
+          for try in 1 2 3; do
+            git fetch --quiet origin main
+            git reset --quiet --hard origin/main
+            sed -i -E "s|(image: ghcr.io/[^/]+/doc-viewer:)[0-9A-Za-z._-]+|\1${TAG}|" apps/doc-viewer/deployment.yaml
+            if git diff --quiet; then echo "không có thay đổi để commit"; exit 0; fi
+            git add apps/doc-viewer/deployment.yaml
+            git commit --quiet -m "doc-viewer: image ${TAG}"
+            if git push --quiet origin HEAD:main; then echo "đã commit tag ${TAG}"; exit 0; fi
+            echo "push thất bại (lần $try/3, main vừa đổi) - thử lại"; sleep $((try * 5))
+          done
+          echo "không push được sau 3 lần"; exit 1

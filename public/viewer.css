@@ -1,0 +1,26 @@
+html,body{height:100%;margin:0;background:#111;overflow:hidden}
+body{font-family:Segoe UI,Arial,sans-serif;color:#1f2933}
+.viewer{position:fixed;inset:0;background:#111;display:flex;flex-direction:column}
+.stage{position:relative;flex:1;min-height:0;overflow:hidden;touch-action:none;cursor:grab}
+.stage.dragging{cursor:grabbing}
+.photo{position:absolute;max-width:none;transform-origin:50% 50%;user-select:none;-webkit-user-drag:none;will-change:transform}
+.toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;background:#fff;border:1px solid #dde3ea;border-radius:12px;padding:8px;box-sizing:border-box}
+.toolbar button,.toolbar select{font:14px Segoe UI,Arial,sans-serif;color:#1f2933;background:#fff;border:1px solid #cfd8e3;border-radius:8px;padding:6px 12px;min-height:36px;cursor:pointer}
+.toolbar button:hover,.toolbar select:hover{background:#f1f4f8}
+.toolbar button:focus-visible,.toolbar select:focus-visible{outline:2px solid #f08a00;outline-offset:1px}
+.toolbar .readout{min-width:52px;text-align:center;font-size:14px;color:#52606d}
+.toolbar .label{font-size:14px;color:#52606d}
+.viewer-image .toolbar{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);max-width:calc(100% - 24px);transition:opacity .25s}
+.viewer-video .toolbar{margin:8px;flex:none;transition:opacity .25s}
+.video-area{flex:1;min-height:0;background:#000;display:flex}
+.video-area video{width:100%;height:100%;object-fit:contain;background:#000}
+.viewer:fullscreen .toolbar{opacity:1}
+.viewer-video:fullscreen .toolbar{position:absolute;left:8px;right:8px;top:8px;margin:0;z-index:2}
+.viewer-video:fullscreen.idle .toolbar,.viewer-image:fullscreen.idle .toolbar{opacity:0;pointer-events:none}
+.viewer.idle{cursor:none}
+.toast{position:absolute;left:50%;top:64px;transform:translateX(-50%);background:#fff;color:#1f2933;border:1px solid #dde3ea;border-radius:12px;padding:10px 16px;font-size:14px;max-width:calc(100% - 32px);box-sizing:border-box;z-index:3;display:none}
+.toast.show{display:block}
+.fail{position:absolute;inset:0;display:none;align-items:center;justify-content:center;padding:16px}
+.fail.show{display:flex}
+.fail div{background:#fff;border:1px solid #dde3ea;border-radius:12px;padding:24px 28px;max-width:420px;line-height:1.5}
+@media (max-width:640px){.toolbar button,.toolbar select{padding:6px 9px;min-height:40px}}
