@@ -2,10 +2,11 @@ name: build
 
 # Repo Public => GitHub Actions miễn phí không giới hạn phút.
 #
-#   1. Build bản amd64, chạy thử THẬT: LibreOffice chuyển một tệp .txt qua chính dịch vụ
-#      (kèm kiểm khóa sai -> 403, máy chủ lạ -> 400, /media, tệp giao diện). Không qua thì dừng.
-#   2. Qua thì build đa kiến trúc (cụm chạy arm64) và đẩy lên ghcr.io/<owner>/doc-viewer:<mã commit>.
-#   3. (Tuỳ chọn) Nếu repo có secret MANIFEST_REPO_TOKEN thì tự ghi tag mới vào repo manifest
+#   1. Chạy thử đơn vị (thư viện font, đọc zip) bằng Node.
+#   2. Build bản amd64, chạy thử THẬT trong container: phiên bản LibreOffice, .txt -> PDF qua dịch vụ,
+#      khóa sai -> 403, máy chủ lạ -> 400, thư viện font tự trích rồi LibreOffice dùng đúng font đó (kiểm bằng pdffonts).
+#   3. Qua thì build đa kiến trúc (cụm chạy arm64) và đẩy lên ghcr.io/<owner>/doc-viewer:<mã commit>.
+#   4. (Tuỳ chọn) Nếu repo có secret MANIFEST_REPO_TOKEN thì tự ghi tag mới vào repo manifest
 #      ci-cd-platform (apps/doc-viewer/deployment.yaml) và commit; ArgoCD tự cuốn chiếu.
 #      Không có secret thì bước này bị bỏ qua, tag mới in ở phần Summary để sửa tay.
 on:
@@ -24,12 +25,20 @@ permissions:
 env:
   MANIFEST_REPOSITORY: Npham140201/ci-cd-platform
   MANIFEST_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
+  GOOGLE_FONTS_COMMIT: 47d54ca1ebb14fd864695f1d39dc734f39017c33
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Chạy thử đơn vị
+        run: node --test test/
 
       - name: Dựng tên image
         id: meta
@@ -51,46 +60,101 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Chạy thử thật (LibreOffice + dịch vụ)
+      - name: Kiểm tra phiên bản LibreOffice và font hệ thống
         run: |
           set -euo pipefail
-          mkdir -p /tmp/hub
+          version=$(docker run --rm doc-viewer:test soffice --headless --version)
+          echo "$version"
+          echo "$version" | grep -q "LibreOffice 26\.2" || { echo "THẤT BẠI: không phải LibreOffice 26.2"; exit 1; }
+          echo "Calibri -> $(docker run --rm doc-viewer:test fc-match Calibri)"
+          echo "Cambria -> $(docker run --rm doc-viewer:test fc-match Cambria)"
+
+      - name: Chạy thử thật (LibreOffice, dịch vụ, thư viện font)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends poppler-utils >/dev/null
+          mkdir -p /tmp/hub /tmp/dvdata
+          chmod 777 /tmp/dvdata
           printf 'Xin chào tài liệu\n' > /tmp/hub/hello.txt
+          curl -fsSL -o /tmp/Poppins-Regular.ttf "https://raw.githubusercontent.com/google/fonts/${GOOGLE_FONTS_COMMIT}/ofl/poppins/Poppins-Regular.ttf"
+          [ "$(stat -c %s /tmp/Poppins-Regular.ttf)" -gt 100000 ] || { echo "THẤT BẠI: tải Poppins không đủ dung lượng"; exit 1; }
+          node test/make-font-pptx.js /tmp/Poppins-Regular.ttf /tmp/hub/font.pptx Poppins
           (cd /tmp/hub && nohup python3 -m http.server 19001 --bind 127.0.0.1 >/dev/null 2>&1 &)
-          docker run -d --name dv --network host \
+          docker run -d --name dv --network host -v /tmp/dvdata:/data \
             -e PORT=18080 -e ALLOWED_HOSTS=127.0.0.1:19001 -e VIEWER_KEY=test \
             doc-viewer:test
           fail() { echo "THẤT BẠI: $1"; docker logs dv || true; exit 1; }
+          base=http://127.0.0.1:18080
           for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1 && break
+            curl -fsS $base/healthz >/dev/null 2>&1 && break
             sleep 1
           done
-          curl -fsS http://127.0.0.1:18080/healthz >/dev/null || fail "dịch vụ không lên"
+          curl -fsS $base/healthz >/dev/null || fail "dịch vụ không lên"
+
           src='http%3A%2F%2F127.0.0.1%3A19001%2Fhello.txt'
-          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/view?src=${src}")
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/view?src=${src}")
           [ "$code" = "403" ] || fail "thiếu khóa phải trả 403, nhận $code"
-          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/view?k=test&src=http%3A%2F%2Fevil.example%2Fx.txt")
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/view?k=test&src=http%3A%2F%2Fevil.example%2Fx.txt")
           [ "$code" = "400" ] || fail "máy chủ lạ phải trả 400, nhận $code"
           for asset in viewer.css image-viewer.js video-viewer.js; do
-            curl -fsS -o /dev/null "http://127.0.0.1:18080/assets/${asset}" || fail "thiếu tệp giao diện ${asset}"
+            curl -fsS -o /dev/null "$base/assets/${asset}" || fail "thiếu tệp giao diện ${asset}"
           done
-          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/media?src=${src}")
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/media?src=${src}")
           [ "$code" = "403" ] || fail "/media thiếu khóa phải trả 403, nhận $code"
-          media=$(curl -fsS -D - -o /dev/null "http://127.0.0.1:18080/media?k=test&download=1&name=hello.txt&src=${src}")
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/fonts")
+          [ "$code" = "403" ] || fail "/fonts thiếu khóa phải trả 403, nhận $code"
+          media=$(curl -fsS -D - -o /dev/null "$base/media?k=test&download=1&name=hello.txt&src=${src}")
           echo "$media" | grep -qi '^content-disposition: attachment' || fail "/media download=1 phải trả attachment"
-          page=$(curl -fsS "http://127.0.0.1:18080/view?k=test&src=${src}")
+
+          page=$(curl -fsS "$base/view?k=test&src=${src}")
           id=$(echo "$page" | grep -oE 'jobId="[0-9a-f]{32}"' | grep -oE '[0-9a-f]{32}' | head -1)
           [ -n "$id" ] || fail "không lấy được mã công việc"
           state=pending
           for i in $(seq 1 90); do
-            state=$(curl -fsS "http://127.0.0.1:18080/status?id=${id}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["state"])')
+            state=$(curl -fsS "$base/status?id=${id}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["state"])')
             [ "$state" != "pending" ] && break
             sleep 2
           done
           [ "$state" = "ready" ] || fail "chuyển đổi không xong (trạng thái: $state)"
-          head=$(curl -fsS "http://127.0.0.1:18080/file/${id}" | head -c 4)
+          head=$(curl -fsS "$base/file/${id}" | head -c 4)
           [ "$head" = "%PDF" ] || fail "kết quả không phải PDF"
-          echo "Chạy thử đạt: .txt -> PDF qua LibreOffice"
+          echo "Đạt: .txt -> PDF qua LibreOffice 26.2"
+
+          echo "--- Thư viện font: PPTX nhúng font Poppins -> dịch vụ tự trích ---"
+          fontsrc='http%3A%2F%2F127.0.0.1%3A19001%2Ffont.pptx'
+          fontpage=$(curl -fsS "$base/view?k=test&type=pptx&name=font.pptx&src=${fontsrc}")
+          fontid=$(echo "$fontpage" | grep -oE 'jobId="[0-9a-f]{32}"' | grep -oE '[0-9a-f]{32}' | head -1)
+          [ -n "$fontid" ] || fail "không lấy được mã công việc của PPTX mẫu"
+          for i in $(seq 1 60); do
+            state=$(curl -fsS "$base/status?id=${fontid}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["state"])')
+            [ "$state" != "pending" ] && break
+            sleep 2
+          done
+          echo "Trạng thái PPTX mẫu: $state (PPTX mẫu không đủ phần để hiển thị, chỉ cần bước trích font chạy)"
+          curl -fsS "$base/fonts?k=test" | grep -q '"family":"Poppins"' || fail "thư viện font không có Poppins sau khi trích"
+          ls /tmp/dvdata/fonts/library/poppins/*.ttf >/dev/null || fail "tệp font không nằm trong thư viện trên đĩa"
+          docker exec dv sh -c 'FONTCONFIG_FILE=/data/fonts/fonts.conf fc-list | grep -qi poppins' || fail "fontconfig không thấy Poppins trong thư viện"
+          echo "Đạt: font nhúng được trích vào thư viện và fontconfig nhận ra"
+
+          echo "--- LibreOffice dùng font từ thư viện (kiểm bằng pdffonts) ---"
+          cat > /tmp/font-test.fodt <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.text">
+           <office:font-face-decls><style:font-face style:name="Poppins" svg:font-family="Poppins"/></office:font-face-decls>
+           <office:automatic-styles><style:style style:name="P1" style:family="paragraph"><style:text-properties style:font-name="Poppins" fo:font-size="24pt"/></style:style></office:automatic-styles>
+           <office:body><office:text><text:p text:style-name="P1">Poppins kiem tra 123</text:p></office:text></office:body>
+          </office:document>
+          XML
+          docker cp /tmp/font-test.fodt dv:/tmp/font-test.fodt
+          docker exec dv sh -c 'mkdir -p /tmp/out-with /tmp/out-without && FONTCONFIG_FILE=/data/fonts/fonts.conf soffice --headless --norestore -env:UserInstallation=file:///tmp/lo-with --convert-to pdf --outdir /tmp/out-with /tmp/font-test.fodt >/dev/null 2>&1 && soffice --headless --norestore -env:UserInstallation=file:///tmp/lo-without --convert-to pdf --outdir /tmp/out-without /tmp/font-test.fodt >/dev/null 2>&1'
+          docker cp dv:/tmp/out-with/font-test.pdf /tmp/with.pdf
+          docker cp dv:/tmp/out-without/font-test.pdf /tmp/without.pdf
+          pdffonts /tmp/with.pdf
+          pdffonts /tmp/without.pdf
+          pdffonts /tmp/with.pdf | grep -qi poppins || fail "PDF có thư viện font KHÔNG nhúng Poppins"
+          if pdffonts /tmp/without.pdf | grep -qi poppins; then fail "đối chứng sai: PDF không có thư viện vẫn có Poppins"; fi
+          echo "Đạt: LibreOffice dùng đúng font trong thư viện (đối chứng: không có thư viện thì không có Poppins)"
+          docker logs dv 2>&1 | grep -E "khởi động sẵn|thư viện font|thêm vào thư viện" || true
 
       - uses: docker/login-action@v3
         with:

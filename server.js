@@ -10,6 +10,7 @@ const { spawn } = require('node:child_process');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { pathToFileURL } = require('node:url');
+const { createFontLibrary } = require('./fontlibrary');
 
 const port = Number(process.env.PORT || 8080);
 const allowedHosts = (process.env.ALLOWED_HOSTS || '').split(',').map((host) => host.trim().toLowerCase()).filter(Boolean);
@@ -19,8 +20,14 @@ const maxDownloadBytes = Number(process.env.MAX_DOWNLOAD_MB || 500) * 1024 * 102
 const convertTimeoutMilliseconds = Number(process.env.CONVERT_TIMEOUT_SECONDS || 300) * 1000;
 const downloadTimeoutMilliseconds = Number(process.env.DOWNLOAD_TIMEOUT_SECONDS || 600) * 1000;
 const cacheDays = Number(process.env.CACHE_DAYS || 30);
-const maxWaitingJobs = Number(process.env.MAX_WAITING_JOBS || 20);
+const maxActiveJobs = Number(process.env.MAX_WAITING_JOBS || 20);
 const sofficePath = process.env.SOFFICE_PATH || 'soffice';
+const convertConcurrency = Math.max(1, Number(process.env.CONVERT_CONCURRENCY || 2));
+const profileRoot = process.env.PROFILE_DIR || path.join(os.tmpdir(), 'doc-viewer-lo');
+const warmupEnabled = process.env.WARMUP !== '0';
+const fontDirectory = process.env.FONT_DIR || path.join(path.dirname(cacheDirectory), 'fonts');
+const ooxmlExtensions = new Set(['docx', 'xlsx', 'pptx', 'ppsx', 'dotx']);
+const fontHarvestExtensions = new Set(['pptx', 'ppsx']);
 
 const imageExtensions = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
 const videoExtensions = new Set(['mp4', 'm4v', 'webm', 'ogv', 'mov']);
@@ -46,8 +53,41 @@ const extensionByContentType = {
 };
 
 const jobs = new Map();
-let queueTail = Promise.resolve();
-let waitingJobs = 0;
+let activeJobs = 0;
+
+function log(jobId, message) {
+  console.log(`[${new Date().toISOString()}] ${jobId ? `[${jobId.slice(0, 8)}] ` : ''}${message}`);
+}
+
+function seconds(startedAt) {
+  return ((Date.now() - startedAt) / 1000).toFixed(1);
+}
+
+const fontLibrary = createFontLibrary({
+  rootDirectory: fontDirectory,
+  allowRestricted: process.env.ALLOW_RESTRICTED_FONTS === '1',
+  maximumLibraryMegabytes: Number(process.env.FONT_LIBRARY_MAX_MB || 500),
+  refreshFontCache: process.env.FONT_REFRESH !== '0',
+  log: (message) => log('', message),
+});
+
+const freeProfileSlots = Array.from({ length: convertConcurrency }, (unused, index) => index);
+const waitingForSlot = [];
+
+function acquireProfileSlot() {
+  if (freeProfileSlots.length > 0) return Promise.resolve(freeProfileSlots.shift());
+  return new Promise((resolve) => waitingForSlot.push(resolve));
+}
+
+function releaseProfileSlot(slot) {
+  const next = waitingForSlot.shift();
+  if (next) next(slot);
+  else freeProfileSlots.push(slot);
+}
+
+function conversionsAhead() {
+  return waitingForSlot.length + (convertConcurrency - freeProfileSlots.length);
+}
 
 function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
@@ -141,17 +181,19 @@ function dispositionExtension(disposition) {
   return match ? extensionOf(decodeURIComponent(match[1])) : '';
 }
 
-async function download(source, targetPath) {
+async function download(source, targetPath, job) {
   const response = await fetch(source.href, { redirect: 'manual', signal: AbortSignal.timeout(downloadTimeoutMilliseconds) });
   if (!response.ok) throw new Error(`Máy chủ tệp trả về mã ${response.status}.`);
   const declaredLength = Number(response.headers.get('content-length') || 0);
   if (declaredLength > maxDownloadBytes) throw new Error('Tệp lớn hơn giới hạn cho phép.');
+  job.totalBytes = declaredLength;
   let total = 0;
   await pipeline(
     Readable.fromWeb(response.body),
     async function* limit(chunks) {
       for await (const chunk of chunks) {
         total += chunk.length;
+        job.receivedBytes = total;
         if (total > maxDownloadBytes) throw new Error('Tệp lớn hơn giới hạn cho phép.');
         yield chunk;
       }
@@ -164,24 +206,26 @@ async function download(source, targetPath) {
   };
 }
 
-function convertToPdf(sourcePath, outputDirectory, jobId) {
-  const profileDirectory = path.join(os.tmpdir(), `doc-viewer-profile-${jobId}`);
+function convertToPdf(sourcePath, outputDirectory, slot) {
+  const profileDirectory = path.join(profileRoot, `slot-${slot}`);
   return new Promise((resolve, reject) => {
     const child = spawn(sofficePath, [
       '--headless', '--norestore', '--nolockcheck', '--nodefault', '--nofirststartwizard',
       `-env:UserInstallation=${pathToFileURL(profileDirectory).href}`,
       '--convert-to', 'pdf', '--outdir', outputDirectory, sourcePath,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...fontLibrary.environment() } });
     let errorTail = '';
     child.stderr.on('data', (data) => { errorTail = (errorTail + data).slice(-400); });
     const timer = setTimeout(() => child.kill('SIGKILL'), convertTimeoutMilliseconds);
     child.on('error', (error) => { clearTimeout(timer); reject(new Error(`Không chạy được bộ chuyển đổi: ${error.message}`)); });
     child.on('close', async (code, signal) => {
       clearTimeout(timer);
-      await fsp.rm(profileDirectory, { recursive: true, force: true });
+      if (signal || code !== 0) await fsp.rm(profileDirectory, { recursive: true, force: true });
       if (signal) return reject(new Error('Chuyển đổi quá thời gian cho phép.'));
       if (code !== 0) return reject(new Error(`Chuyển đổi thất bại (mã ${code}). ${errorTail.trim()}`));
-      resolve(path.join(outputDirectory, `${path.basename(sourcePath, path.extname(sourcePath))}.pdf`));
+      const pdfPath = path.join(outputDirectory, `${path.basename(sourcePath, path.extname(sourcePath))}.pdf`);
+      if (!fs.existsSync(pdfPath)) return reject(new Error('Bộ chuyển đổi không tạo được PDF (tệp có thể hỏng hoặc không hỗ trợ).'));
+      resolve(pdfPath);
     });
   });
 }
@@ -193,7 +237,10 @@ async function runJob(job, source, hints) {
     await fsp.mkdir(directory, { recursive: true });
     job.stage = 'download';
     const rawPath = path.join(directory, 'source.bin');
-    const received = await download(source, rawPath);
+    const label = hints.name || source.pathname.split('/').pop() || job.id;
+    const downloadStartedAt = Date.now();
+    const received = await download(source, rawPath, job);
+    log(job.id, `đã tải ${label}: ${(job.receivedBytes / 1048576).toFixed(1)} MB trong ${seconds(downloadStartedAt)} giây`);
 
     let extension = hints.type || extensionOf(hints.name) || dispositionExtension(received.disposition)
       || extensionOf(source.pathname) || extensionByContentType[received.contentType] || '';
@@ -210,10 +257,37 @@ async function runJob(job, source, hints) {
 
     let resultName;
     if (officeExtensions.has(extension)) {
-      job.stage = 'convert';
       const officePath = path.join(directory, `source.${extension}`);
       await fsp.rename(rawPath, officePath);
-      const pdfPath = await convertToPdf(officePath, directory, job.id);
+
+      if (ooxmlExtensions.has(extension)) {
+        job.stage = 'fonts';
+        try {
+          if (fontHarvestExtensions.has(extension)) {
+            const harvested = await fontLibrary.harvest(officePath, label);
+            if (harvested.added.length > 0) log(job.id, `thêm vào thư viện font: ${harvested.added.join(', ')}`);
+            if (harvested.skipped.length > 0) log(job.id, `bỏ qua font nhúng: ${harvested.skipped.join('; ')}`);
+          }
+          const missing = await fontLibrary.reportMissing(officePath, label);
+          if (missing.length > 0) log(job.id, `font tài liệu dùng nhưng chưa có (đã thay): ${missing.map((item) => `${item.family} -> ${item.substitute}`).join(', ')}`);
+        } catch (error) {
+          log(job.id, `bỏ qua bước font: ${error.message}`);
+        }
+      }
+
+      job.stage = 'queued';
+      const waitStartedAt = Date.now();
+      const slot = await acquireProfileSlot();
+      job.stage = 'convert';
+      log(job.id, `bắt đầu chuyển ${label} sang PDF (đã chờ ${seconds(waitStartedAt)} giây, khe ${slot})`);
+      const convertStartedAt = Date.now();
+      let pdfPath;
+      try {
+        pdfPath = await convertToPdf(officePath, directory, slot);
+      } finally {
+        releaseProfileSlot(slot);
+      }
+      log(job.id, `chuyển xong ${label} trong ${seconds(convertStartedAt)} giây`);
       await fsp.rm(officePath, { force: true });
       resultName = path.basename(pdfPath);
       extension = 'pdf';
@@ -227,9 +301,11 @@ async function runJob(job, source, hints) {
     await fsp.writeFile(path.join(directory, 'result.json'), JSON.stringify(meta));
     job.result = { filePath: path.join(directory, resultName), contentType: meta.contentType };
     job.state = 'ready';
+    log(job.id, `sẵn sàng sau ${seconds(job.startedAt)} giây`);
   } catch (error) {
     job.state = 'failed';
     job.message = error.message;
+    log(job.id, `thất bại sau ${seconds(job.startedAt)} giây: ${error.message}`);
     await fsp.rm(directory, { recursive: true, force: true });
   }
 }
@@ -254,17 +330,15 @@ function ensureJob(id, source, hints) {
     jobs.set(id, cached);
     return cached;
   }
-  const job = { id, state: 'pending', stage: 'queued' };
+  const job = { id, state: 'pending', stage: 'download', startedAt: Date.now(), receivedBytes: 0, totalBytes: 0 };
   jobs.set(id, job);
-  if (waitingJobs >= maxWaitingJobs) {
+  if (activeJobs >= maxActiveJobs) {
     job.state = 'failed';
     job.message = 'Máy chủ đang bận, vui lòng thử lại sau ít phút.';
     return job;
   }
-  waitingJobs += 1;
-  const run = queueTail.then(() => runJob(job, source, hints));
-  queueTail = run.catch(() => {});
-  run.finally(() => { waitingJobs -= 1; });
+  activeJobs += 1;
+  runJob(job, source, hints).finally(() => { activeJobs -= 1; });
   return job;
 }
 
@@ -398,7 +472,9 @@ var jobId=${JSON.stringify(id)};var fileLabel=${JSON.stringify(fileLabel).replac
 function check(){fetch('/status?id='+jobId,{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
 if(s.state==='ready'){location.replace(s.next.indexOf('/viewer/')===0?s.next+'?name='+encodeURIComponent(fileLabel):s.next);return}
 if(s.state==='failed'){document.getElementById('title').textContent='Không xem được tài liệu';document.getElementById('message').textContent=s.message;document.getElementById('bar').style.display='none';return}
-document.getElementById('message').textContent=s.stage==='convert'?'Đang chuyển tài liệu để xem...':s.stage==='download'?'Đang tải tài liệu...':'Đang chờ đến lượt...';
+var megabytes=function(n){return (n/1048576).toFixed(1)};
+var text=s.stage==='convert'?'Đang chuyển tài liệu để xem':s.stage==='download'?'Đang tải tài liệu'+(s.totalBytes?' ('+megabytes(s.receivedBytes)+'/'+megabytes(s.totalBytes)+' MB)':''):s.stage==='fonts'?'Đang chuẩn bị font':'Đang chờ đến lượt'+(s.ahead?' (còn '+s.ahead+' tài liệu phía trước)':'');
+document.getElementById('message').textContent=text+'... '+(s.elapsedSeconds||0)+' giây';
 setTimeout(check,1500)}).catch(function(){setTimeout(check,3000)})}
 check();
 </script>`;
@@ -414,7 +490,20 @@ const server = http.createServer((request, response) => {
   if (url.pathname === '/status') {
     const job = jobs.get(url.searchParams.get('id') || '');
     if (!job) return sendJson(response, 404, { state: 'failed', message: 'Không tìm thấy yêu cầu. Hãy mở lại tài liệu.' });
-    return sendJson(response, 200, { state: job.state, stage: job.stage, message: job.message, next: job.state === 'ready' ? resultUrl(job) : undefined });
+    return sendJson(response, 200, {
+      state: job.state,
+      stage: job.stage,
+      message: job.message,
+      next: job.state === 'ready' ? resultUrl(job) : undefined,
+      ahead: job.state === 'pending' && job.stage === 'queued' ? conversionsAhead() : 0,
+      elapsedSeconds: job.startedAt ? Math.round((Date.now() - job.startedAt) / 1000) : 0,
+      receivedBytes: job.receivedBytes || 0,
+      totalBytes: job.totalBytes || 0,
+    });
+  }
+  if (url.pathname === '/fonts') {
+    if (!keyIsValid(url.searchParams.get('k'))) return sendMessage(response, 403, 'Không có quyền', 'Khóa truy cập không đúng.');
+    return sendJson(response, 200, fontLibrary.summary());
   }
   if (url.pathname === '/media') return handleMedia(request, response, url.searchParams);
   const assetMatch = /^\/assets\/([a-z-]+\.(?:css|js))$/.exec(url.pathname);
@@ -453,7 +542,36 @@ if (allowedHosts.length === 0) {
   console.error('Thiếu ALLOWED_HOSTS (danh sách máy chủ tệp được phép, cách nhau bằng dấu phẩy).');
   process.exit(1);
 }
+async function warmUpConverter() {
+  if (!warmupEnabled) return;
+  const directory = path.join(os.tmpdir(), 'doc-viewer-warmup');
+  await fsp.rm(directory, { recursive: true, force: true });
+  await fsp.mkdir(directory, { recursive: true });
+  const samplePath = path.join(directory, 'warmup.txt');
+  await fsp.writeFile(samplePath, 'warmup\n');
+  for (let index = 0; index < convertConcurrency; index++) {
+    const slot = await acquireProfileSlot();
+    const startedAt = Date.now();
+    try {
+      await convertToPdf(samplePath, directory, slot);
+      log('', `khởi động sẵn LibreOffice (khe ${slot}) mất ${seconds(startedAt)} giây`);
+    } catch (error) {
+      log('', `khởi động sẵn LibreOffice không thành công: ${error.message}`);
+    } finally {
+      releaseProfileSlot(slot);
+    }
+  }
+  await fsp.rm(directory, { recursive: true, force: true });
+}
+
 fs.mkdirSync(cacheDirectory, { recursive: true });
 cleanCache();
 setInterval(cleanCache, 6 * 3600 * 1000).unref();
-server.listen(port, () => console.log(`doc-viewer lắng nghe cổng ${port}`));
+fontLibrary.initialize()
+  .catch((error) => log('', `không khởi tạo được thư viện font: ${error.message}`))
+  .finally(() => {
+    server.listen(port, () => {
+      log('', `doc-viewer lắng nghe cổng ${port} (chuyển đổi song song tối đa ${convertConcurrency})`);
+      warmUpConverter().catch((error) => log('', `lỗi khởi động sẵn: ${error.message}`));
+    });
+  });
