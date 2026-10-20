@@ -38,7 +38,7 @@ jobs:
           node-version: 22
 
       - name: Chạy thử đơn vị
-        run: node --test test/
+        run: node --test "test/*.test.js"
 
       - name: Dựng tên image
         id: meta

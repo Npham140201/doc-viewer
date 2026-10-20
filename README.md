@@ -27,7 +27,7 @@ Khi chuyển PPTX, dịch vụ tự trích các font nhúng (`ppt/fonts/*.fntdat
 ## Chạy thử
 
 ```
-node --test test/                       # thư viện font, đọc zip
+node --test "test/*.test.js"          # thư viện font, đọc zip
 node test/make-font-pptx.js font.ttf mau.pptx Tên    # tạo PPTX mẫu nhúng một font
 ```
 
