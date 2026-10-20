@@ -6,7 +6,7 @@ Chạy và triển khai trên cụm k3s: xem `docs/doc-viewer-setup.md` trong re
 
 ```
 GET /view?k=<khóa>&src=<link Hub mã hóa URL>&type=<đuôi>&name=<tên tệp>
-GET /media?k=&src=&name=&download=1     chuyển tiếp có Range (chụp khung hình, tải về)
+GET /media?k=&src=&name=&download=1     chuyển tiếp có Range (tải về)
 GET /healthz
 ```
 
