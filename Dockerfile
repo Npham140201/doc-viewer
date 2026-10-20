@@ -42,7 +42,7 @@ RUN set -eux; \
     ln -s "/opt/libreoffice${series}/program/soffice" /usr/local/bin/soffice
 
 WORKDIR /app
-COPY package.json server.js fontlibrary.js zipreader.js transfer.js ./
+COPY package.json server.js fontlibrary.js zipreader.js zipwriter.js pptxnormalize.js transfer.js ./
 COPY public ./public
 
 RUN useradd -m -u 10001 viewer && mkdir -p /data/cache /data/fonts && chown -R viewer /data

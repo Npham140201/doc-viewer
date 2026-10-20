@@ -11,6 +11,7 @@ const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { pathToFileURL } = require('node:url');
 const { createFontLibrary } = require('./fontlibrary');
+const { normalizePresentation } = require('./pptxnormalize');
 const { createSlotPool, downloadFile, runProcess } = require('./transfer');
 
 const port = Number(process.env.PORT || 8080);
@@ -310,6 +311,19 @@ async function runJob(job, source, hints) {
           if (missing.length > 0) log(job.id, `font tài liệu dùng nhưng chưa có (đã thay): ${missing.map((item) => `${item.family} -> ${item.substitute}`).join(', ')}`);
         } catch (error) {
           log(job.id, `bỏ qua bước font: ${error.message}`);
+        }
+      }
+
+      if (fontHarvestExtensions.has(extension)) {
+        try {
+          const rewrittenPath = `${officePath}.fixed`;
+          const converted = await normalizePresentation(officePath, rewrittenPath);
+          if (converted > 0) {
+            await fsp.rename(rewrittenPath, officePath);
+            log(job.id, `đổi ${converted} hình ảnh xoay sang ảnh thường để LibreOffice dựng đúng`);
+          }
+        } catch (error) {
+          log(job.id, `bỏ qua bước sửa hình ảnh xoay: ${error.message}`);
         }
       }
 

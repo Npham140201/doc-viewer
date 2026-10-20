@@ -39,6 +39,9 @@ async function openZip(filePath) {
       if (central.readUInt32LE(position) !== centralDirectorySignature) break;
       const flags = central.readUInt16LE(position + 8);
       const method = central.readUInt16LE(position + 10);
+      const modifiedTime = central.readUInt16LE(position + 12);
+      const modifiedDate = central.readUInt16LE(position + 14);
+      const checksum = central.readUInt32LE(position + 16);
       const compressedSize = central.readUInt32LE(position + 20);
       const uncompressedSize = central.readUInt32LE(position + 24);
       const nameLength = central.readUInt16LE(position + 28);
@@ -46,8 +49,20 @@ async function openZip(filePath) {
       const commentLength = central.readUInt16LE(position + 32);
       const localOffset = central.readUInt32LE(position + 42);
       const name = central.toString('utf8', position + 46, position + 46 + nameLength);
-      entries.set(name, { name, flags, method, compressedSize, uncompressedSize, localOffset });
+      entries.set(name, { name, flags, method, modifiedTime, modifiedDate, checksum, compressedSize, uncompressedSize, localOffset });
       position += 46 + nameLength + extraLength + commentLength;
+    }
+
+    async function readRaw(name) {
+      const entry = entries.get(name);
+      if (!entry) return null;
+      const local = Buffer.alloc(30);
+      await handle.read(local, 0, 30, entry.localOffset);
+      if (local.readUInt32LE(0) !== localHeaderSignature) throw new Error('Tiêu đề mục zip không hợp lệ.');
+      const dataStart = entry.localOffset + 30 + local.readUInt16LE(26) + local.readUInt16LE(28);
+      const compressed = Buffer.alloc(entry.compressedSize);
+      await handle.read(compressed, 0, entry.compressedSize, dataStart);
+      return compressed;
     }
 
     async function read(name, maximumBytes) {
@@ -66,7 +81,7 @@ async function openZip(filePath) {
       throw new Error(`Kiểu nén zip ${entry.method} chưa được hỗ trợ.`);
     }
 
-    return { entries, read, close: () => handle.close() };
+    return { entries, read, readRaw, close: () => handle.close() };
   } catch (error) {
     await handle.close();
     throw error;
