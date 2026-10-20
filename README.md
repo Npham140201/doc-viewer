@@ -32,3 +32,10 @@ node test/make-font-pptx.js font.ttf mau.pptx Tên    # tạo PPTX mẫu nhúng 
 ```
 
 Image build bằng LibreOffice chính thức của The Document Foundation (cài từ gói `.deb`, kiểm SHA-256), nền Node 22 trên Debian trixie. Workflow `build` chạy thử thật trong container trước khi đẩy image.
+
+## Tải nhanh và chuyển trước
+
+- Tải tệp từ Hub bằng **nhiều kết nối song song theo đoạn Range** (`DOWNLOAD_CONNECTIONS`=6, đoạn `DOWNLOAD_CHUNK_MB`=4); đo thực tế: Hub giới hạn từng kết nối (~1 MB/s) nên bốn kết nối cho tổng gấp ~3,7 lần. Hub không hỗ trợ Range thì tự quay về một luồng. Tối đa `DOWNLOAD_CONCURRENCY` tệp được tải cùng lúc.
+- `GET /prefetch?k=&src=&type=&name=` bắt đầu tải và chuyển ngầm (ưu tiên thấp), trả 202 ngay; việc người dùng bấm xem (`/view`) tự vượt lên trước các việc chuyển trước đang xếp hàng.
+- PDF xuất với ảnh giảm còn `PDF_IMAGE_DPI`=150 dpi (lỗi thì tự thử lại cấu hình mặc định), rồi `qpdf --linearize` để trình xem hiện trang đầu sớm (`LINEARIZE=0` để tắt).
+- PDF kết quả trả kèm `ETag`/`Last-Modified` và `Cache-Control: private, no-cache` (trả 304 nếu chưa đổi); tệp đệm bị xóa thì tự chuyển lại.

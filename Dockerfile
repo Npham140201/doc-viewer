@@ -11,7 +11,7 @@ RUN apt-get update \
         libxinerama1 libxext6 libxrender1 libsm6 libice6 libx11-6 libx11-xcb1 libxrandr2 \
         libfontconfig1 libfreetype6 libcairo2 libcups2t64 libdbus-1-3 libdbus-glib-1-2 libnss3 \
         libxslt1.1 libxml2 libglu1-mesa libgl1 libgssapi-krb5-2 \
-        fonts-liberation fonts-dejavu-core fonts-noto-core fonts-crosextra-carlito fonts-crosextra-caladea \
+        fonts-liberation fonts-dejavu-core fonts-noto-core fonts-crosextra-carlito fonts-crosextra-caladea qpdf \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -42,7 +42,7 @@ RUN set -eux; \
     ln -s "/opt/libreoffice${series}/program/soffice" /usr/local/bin/soffice
 
 WORKDIR /app
-COPY package.json server.js fontlibrary.js zipreader.js ./
+COPY package.json server.js fontlibrary.js zipreader.js transfer.js ./
 COPY public ./public
 
 RUN useradd -m -u 10001 viewer && mkdir -p /data/cache /data/fonts && chown -R viewer /data

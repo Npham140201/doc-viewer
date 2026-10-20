@@ -11,6 +11,7 @@ const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { pathToFileURL } = require('node:url');
 const { createFontLibrary } = require('./fontlibrary');
+const { createSlotPool, downloadFile, runProcess } = require('./transfer');
 
 const port = Number(process.env.PORT || 8080);
 const allowedHosts = (process.env.ALLOWED_HOSTS || '').split(',').map((host) => host.trim().toLowerCase()).filter(Boolean);
@@ -28,6 +29,11 @@ const warmupEnabled = process.env.WARMUP !== '0';
 const fontDirectory = process.env.FONT_DIR || path.join(path.dirname(cacheDirectory), 'fonts');
 const ooxmlExtensions = new Set(['docx', 'xlsx', 'pptx', 'ppsx', 'dotx']);
 const fontHarvestExtensions = new Set(['pptx', 'ppsx']);
+const downloadConnections = Math.max(1, Number(process.env.DOWNLOAD_CONNECTIONS || 6));
+const downloadChunkBytes = Math.max(1, Number(process.env.DOWNLOAD_CHUNK_MB || 4)) * 1024 * 1024;
+const downloadConcurrency = Math.max(1, Number(process.env.DOWNLOAD_CONCURRENCY || 2));
+const pdfImageDpi = Number(process.env.PDF_IMAGE_DPI === undefined ? 150 : process.env.PDF_IMAGE_DPI);
+const linearizeEnabled = process.env.LINEARIZE !== '0';
 
 const imageExtensions = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
 const videoExtensions = new Set(['mp4', 'm4v', 'webm', 'ogv', 'mov']);
@@ -71,23 +77,8 @@ const fontLibrary = createFontLibrary({
   log: (message) => log('', message),
 });
 
-const freeProfileSlots = Array.from({ length: convertConcurrency }, (unused, index) => index);
-const waitingForSlot = [];
-
-function acquireProfileSlot() {
-  if (freeProfileSlots.length > 0) return Promise.resolve(freeProfileSlots.shift());
-  return new Promise((resolve) => waitingForSlot.push(resolve));
-}
-
-function releaseProfileSlot(slot) {
-  const next = waitingForSlot.shift();
-  if (next) next(slot);
-  else freeProfileSlots.push(slot);
-}
-
-function conversionsAhead() {
-  return waitingForSlot.length + (convertConcurrency - freeProfileSlots.length);
-}
+const convertPool = createSlotPool(convertConcurrency);
+const downloadPool = createSlotPool(downloadConcurrency);
 
 function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
@@ -182,52 +173,91 @@ function dispositionExtension(disposition) {
 }
 
 async function download(source, targetPath, job) {
-  const response = await fetch(source.href, { redirect: 'manual', signal: AbortSignal.timeout(downloadTimeoutMilliseconds) });
-  if (!response.ok) throw new Error(`Máy chủ tệp trả về mã ${response.status}.`);
-  const declaredLength = Number(response.headers.get('content-length') || 0);
-  if (declaredLength > maxDownloadBytes) throw new Error('Tệp lớn hơn giới hạn cho phép.');
-  job.totalBytes = declaredLength;
-  let total = 0;
-  await pipeline(
-    Readable.fromWeb(response.body),
-    async function* limit(chunks) {
-      for await (const chunk of chunks) {
-        total += chunk.length;
-        job.receivedBytes = total;
-        if (total > maxDownloadBytes) throw new Error('Tệp lớn hơn giới hạn cho phép.');
-        yield chunk;
-      }
-    },
-    fs.createWriteStream(targetPath),
-  );
-  return {
-    contentType: (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
-    disposition: response.headers.get('content-disposition') || '',
-  };
+  return downloadFile({
+    url: source.href,
+    targetPath,
+    connections: downloadConnections,
+    chunkBytes: downloadChunkBytes,
+    maxBytes: maxDownloadBytes,
+    timeoutMilliseconds: downloadTimeoutMilliseconds,
+    onTotal: (total) => { job.totalBytes = total; },
+    onProgress: (bytes) => { job.receivedBytes += bytes; },
+    onReset: () => { job.receivedBytes = 0; },
+    onFallback: (error) => log(job.id, `tải song song lỗi (${error.message}), chuyển sang một luồng`),
+  });
 }
 
-function convertToPdf(sourcePath, outputDirectory, slot) {
+const pdfFilterNames = {
+  pptx: 'impress_pdf_Export', ppt: 'impress_pdf_Export', pps: 'impress_pdf_Export', ppsx: 'impress_pdf_Export', odp: 'impress_pdf_Export',
+  docx: 'writer_pdf_Export', doc: 'writer_pdf_Export', dotx: 'writer_pdf_Export', dot: 'writer_pdf_Export', rtf: 'writer_pdf_Export', odt: 'writer_pdf_Export', txt: 'writer_pdf_Export',
+  xlsx: 'calc_pdf_Export', xls: 'calc_pdf_Export', ods: 'calc_pdf_Export', csv: 'calc_pdf_Export',
+};
+
+function pdfFilterFor(extension) {
+  const name = pdfFilterNames[extension];
+  if (!name || pdfImageDpi <= 0) return 'pdf';
+  const options = { ReduceImageResolution: { type: 'boolean', value: 'true' }, MaxImageResolution: { type: 'long', value: String(pdfImageDpi) } };
+  return `pdf:${name}:${JSON.stringify(options)}`;
+}
+
+function runSoffice(sourcePath, outputDirectory, slot, filter) {
   const profileDirectory = path.join(profileRoot, `slot-${slot}`);
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (outcome) => {
+      if (settled) return;
+      settled = true;
+      resolve(outcome);
+    };
     const child = spawn(sofficePath, [
       '--headless', '--norestore', '--nolockcheck', '--nodefault', '--nofirststartwizard',
       `-env:UserInstallation=${pathToFileURL(profileDirectory).href}`,
-      '--convert-to', 'pdf', '--outdir', outputDirectory, sourcePath,
+      '--convert-to', filter, '--outdir', outputDirectory, sourcePath,
     ], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...fontLibrary.environment() } });
     let errorTail = '';
+    let timedOut = false;
     child.stderr.on('data', (data) => { errorTail = (errorTail + data).slice(-400); });
-    const timer = setTimeout(() => child.kill('SIGKILL'), convertTimeoutMilliseconds);
-    child.on('error', (error) => { clearTimeout(timer); reject(new Error(`Không chạy được bộ chuyển đổi: ${error.message}`)); });
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, convertTimeoutMilliseconds);
+    child.on('error', (error) => { clearTimeout(timer); finish({ spawnError: error.message, errorTail }); });
     child.on('close', async (code, signal) => {
       clearTimeout(timer);
       if (signal || code !== 0) await fsp.rm(profileDirectory, { recursive: true, force: true });
-      if (signal) return reject(new Error('Chuyển đổi quá thời gian cho phép.'));
-      if (code !== 0) return reject(new Error(`Chuyển đổi thất bại (mã ${code}). ${errorTail.trim()}`));
-      const pdfPath = path.join(outputDirectory, `${path.basename(sourcePath, path.extname(sourcePath))}.pdf`);
-      if (!fs.existsSync(pdfPath)) return reject(new Error('Bộ chuyển đổi không tạo được PDF (tệp có thể hỏng hoặc không hỗ trợ).'));
-      resolve(pdfPath);
+      finish({ code, signal, timedOut, errorTail });
     });
   });
+}
+
+async function convertToPdf(sourcePath, outputDirectory, slot) {
+  const pdfPath = path.join(outputDirectory, `${path.basename(sourcePath, path.extname(sourcePath))}.pdf`);
+  const firstFilter = pdfFilterFor(extensionOf(sourcePath));
+  const filters = firstFilter === 'pdf' ? ['pdf'] : [firstFilter, 'pdf'];
+  let lastError = 'Chuyển đổi thất bại.';
+  for (let index = 0; index < filters.length; index++) {
+    const outcome = await runSoffice(sourcePath, outputDirectory, slot, filters[index]);
+    if (outcome.timedOut) throw new Error('Chuyển đổi quá thời gian cho phép.');
+    if (outcome.spawnError) throw new Error(`Không chạy được bộ chuyển đổi: ${outcome.spawnError}`);
+    if (outcome.code === 0 && fs.existsSync(pdfPath)) return pdfPath;
+    lastError = outcome.code === 0
+      ? 'Bộ chuyển đổi không tạo được PDF (tệp có thể hỏng hoặc không hỗ trợ).'
+      : `Chuyển đổi thất bại (mã ${outcome.code}). ${outcome.errorTail.trim()}`;
+    if (index < filters.length - 1) log('', 'chuyển với tùy chọn giảm ảnh thất bại, thử lại với cấu hình mặc định');
+  }
+  throw new Error(lastError);
+}
+
+async function optimizePdf(job, pdfPath) {
+  if (!linearizeEnabled) return;
+  const startedAt = Date.now();
+  const outputPath = `${pdfPath}.linear`;
+  const before = fs.statSync(pdfPath).size;
+  const outcome = await runProcess('qpdf', ['--linearize', pdfPath, outputPath], 90000);
+  if ((outcome.code === 0 || outcome.code === 3) && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+    await fsp.rename(outputPath, pdfPath);
+    log(job.id, `tối ưu PDF để xem từng trang: ${(before / 1048576).toFixed(1)} MB -> ${(fs.statSync(pdfPath).size / 1048576).toFixed(1)} MB trong ${seconds(startedAt)} giây`);
+  } else {
+    await fsp.rm(outputPath, { force: true });
+    log(job.id, 'không tối ưu được PDF (bỏ qua, dùng bản gốc).');
+  }
 }
 
 async function runJob(job, source, hints) {
@@ -235,12 +265,20 @@ async function runJob(job, source, hints) {
   try {
     await fsp.rm(directory, { recursive: true, force: true });
     await fsp.mkdir(directory, { recursive: true });
-    job.stage = 'download';
     const rawPath = path.join(directory, 'source.bin');
     const label = hints.name || source.pathname.split('/').pop() || job.id;
-    const downloadStartedAt = Date.now();
-    const received = await download(source, rawPath, job);
-    log(job.id, `đã tải ${label}: ${(job.receivedBytes / 1048576).toFixed(1)} MB trong ${seconds(downloadStartedAt)} giây`);
+
+    job.stage = 'waitdownload';
+    const downloadSlot = await downloadPool.acquire(job);
+    let received;
+    try {
+      job.stage = 'download';
+      const downloadStartedAt = Date.now();
+      received = await download(source, rawPath, job);
+      log(job.id, `đã tải ${label}: ${(job.receivedBytes / 1048576).toFixed(1)} MB trong ${seconds(downloadStartedAt)} giây (${received.mode})`);
+    } finally {
+      downloadPool.release(downloadSlot);
+    }
 
     let extension = hints.type || extensionOf(hints.name) || dispositionExtension(received.disposition)
       || extensionOf(source.pathname) || extensionByContentType[received.contentType] || '';
@@ -277,7 +315,7 @@ async function runJob(job, source, hints) {
 
       job.stage = 'queued';
       const waitStartedAt = Date.now();
-      const slot = await acquireProfileSlot();
+      const slot = await convertPool.acquire(job);
       job.stage = 'convert';
       log(job.id, `bắt đầu chuyển ${label} sang PDF (đã chờ ${seconds(waitStartedAt)} giây, khe ${slot})`);
       const convertStartedAt = Date.now();
@@ -285,15 +323,21 @@ async function runJob(job, source, hints) {
       try {
         pdfPath = await convertToPdf(officePath, directory, slot);
       } finally {
-        releaseProfileSlot(slot);
+        convertPool.release(slot);
       }
       log(job.id, `chuyển xong ${label} trong ${seconds(convertStartedAt)} giây`);
       await fsp.rm(officePath, { force: true });
+      job.stage = 'optimize';
+      await optimizePdf(job, pdfPath);
       resultName = path.basename(pdfPath);
       extension = 'pdf';
     } else if (contentTypeByExtension[extension]) {
       resultName = `result.${extension}`;
       await fsp.rename(rawPath, path.join(directory, resultName));
+      if (extension === 'pdf') {
+        job.stage = 'optimize';
+        await optimizePdf(job, path.join(directory, resultName));
+      }
     } else {
       throw new Error(`Chưa hỗ trợ loại tệp .${extension}.`);
     }
@@ -322,15 +366,23 @@ function readCachedResult(id) {
   }
 }
 
-function ensureJob(id, source, hints) {
+function ensureJob(id, source, hints, priority = 'high') {
   const known = jobs.get(id);
-  if (known && known.state !== 'failed') return known;
+  if (known && known.state === 'ready' && known.result && !fs.existsSync(known.result.filePath)) jobs.delete(id);
+  else if (known && known.state !== 'failed') {
+    if (priority === 'high' && known.state === 'pending' && known.priority === 'low') {
+      known.priority = 'high';
+      downloadPool.promote(known);
+      convertPool.promote(known);
+    }
+    return known;
+  }
   const cached = readCachedResult(id);
   if (cached) {
     jobs.set(id, cached);
     return cached;
   }
-  const job = { id, state: 'pending', stage: 'download', startedAt: Date.now(), receivedBytes: 0, totalBytes: 0 };
+  const job = { id, state: 'pending', stage: 'waitdownload', priority, startedAt: Date.now(), receivedBytes: 0, totalBytes: 0 };
   jobs.set(id, job);
   if (activeJobs >= maxActiveJobs) {
     job.state = 'failed';
@@ -353,6 +405,17 @@ function serveFile(request, response, filePath, contentType, downloadName = '') 
   } catch {
     return sendMessage(response, 404, 'Không tìm thấy', 'Tệp không còn trong bộ nhớ đệm.');
   }
+  const entityTag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+  const lastModified = stat.mtime.toUTCString();
+  const validators = { ETag: entityTag, 'Last-Modified': lastModified, 'Cache-Control': 'private, no-cache' };
+  if (!request.headers.range) {
+    const matchesEntityTag = request.headers['if-none-match'] === entityTag;
+    const notModifiedSince = !request.headers['if-none-match'] && request.headers['if-modified-since'] && new Date(request.headers['if-modified-since']).getTime() >= Math.floor(stat.mtimeMs / 1000) * 1000;
+    if (matchesEntityTag || notModifiedSince) {
+      response.writeHead(304, validators);
+      return response.end();
+    }
+  }
   let start = 0;
   let end = stat.size - 1;
   let status = 200;
@@ -371,11 +434,11 @@ function serveFile(request, response, filePath, contentType, downloadName = '') 
     status = 206;
   }
   const headers = {
+    ...validators,
     'Content-Type': contentType,
     'Content-Length': end - start + 1,
     'Accept-Ranges': 'bytes',
     'Content-Disposition': contentDisposition(downloadName),
-    'Cache-Control': 'private, max-age=3600',
   };
   if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${stat.size}`;
   response.writeHead(status, headers);
@@ -462,7 +525,7 @@ function handleView(request, response, query) {
   }
 
   const id = crypto.createHash('sha256').update(source.href).digest('hex').slice(0, 32);
-  const job = ensureJob(id, source, hints);
+  const job = ensureJob(id, source, hints, 'high');
   if (job.state === 'ready') {
     response.writeHead(302, { Location: resultUrl(job, fileLabel), 'Cache-Control': 'no-store' });
     return response.end();
@@ -473,7 +536,7 @@ function check(){fetch('/status?id='+jobId,{cache:'no-store'}).then(function(r){
 if(s.state==='ready'){location.replace(s.next.indexOf('/viewer/')===0?s.next+'?name='+encodeURIComponent(fileLabel):s.next);return}
 if(s.state==='failed'){document.getElementById('title').textContent='Không xem được tài liệu';document.getElementById('message').textContent=s.message;document.getElementById('bar').style.display='none';return}
 var megabytes=function(n){return (n/1048576).toFixed(1)};
-var text=s.stage==='convert'?'Đang chuyển tài liệu để xem':s.stage==='download'?'Đang tải tài liệu'+(s.totalBytes?' ('+megabytes(s.receivedBytes)+'/'+megabytes(s.totalBytes)+' MB)':''):s.stage==='fonts'?'Đang chuẩn bị font':'Đang chờ đến lượt'+(s.ahead?' (còn '+s.ahead+' tài liệu phía trước)':'');
+var text=s.stage==='convert'?'Đang chuyển tài liệu để xem':s.stage==='download'?'Đang tải tài liệu'+(s.totalBytes?' ('+megabytes(s.receivedBytes)+'/'+megabytes(s.totalBytes)+' MB)':''):s.stage==='fonts'?'Đang chuẩn bị font':s.stage==='optimize'?'Đang tối ưu để xem':s.stage==='waitdownload'?'Đang chờ tải'+(s.ahead>1?' (còn '+(s.ahead-1)+' tài liệu phía trước)':''):'Đang chờ đến lượt'+(s.ahead?' (còn '+s.ahead+' tài liệu phía trước)':'');
 document.getElementById('message').textContent=text+'... '+(s.elapsedSeconds||0)+' giây';
 setTimeout(check,1500)}).catch(function(){setTimeout(check,3000)})}
 check();
@@ -482,11 +545,24 @@ check();
   sendHtml(response, 200, renderPage(fileLabel, body));
 }
 
+function handlePrefetch(request, response, query) {
+  if (!keyIsValid(query.get('k'))) return sendJson(response, 403, { state: 'forbidden' });
+  const source = parseAllowedSource(query.get('src'));
+  if (!source) return sendJson(response, 400, { state: 'invalid' });
+  const hints = { type: (query.get('type') || '').toLowerCase().replace(/^\./, ''), name: query.get('name') || '' };
+  const presetExtension = hints.type || extensionOf(hints.name) || extensionOf(source.pathname);
+  if (imageExtensions.has(presetExtension) || videoExtensions.has(presetExtension) || downloadOnlyExtensions.has(presetExtension)) return sendJson(response, 200, { state: 'skipped' });
+  const id = crypto.createHash('sha256').update(source.href).digest('hex').slice(0, 32);
+  const job = ensureJob(id, source, hints, 'low');
+  sendJson(response, 202, { id, state: job.state });
+}
+
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, 'http://localhost');
   if (request.method !== 'GET') return sendMessage(response, 405, 'Không hỗ trợ', 'Chỉ hỗ trợ GET.');
   if (url.pathname === '/healthz') return sendJson(response, 200, { ok: true });
   if (url.pathname === '/view') return handleView(request, response, url.searchParams);
+  if (url.pathname === '/prefetch') return handlePrefetch(request, response, url.searchParams);
   if (url.pathname === '/status') {
     const job = jobs.get(url.searchParams.get('id') || '');
     if (!job) return sendJson(response, 404, { state: 'failed', message: 'Không tìm thấy yêu cầu. Hãy mở lại tài liệu.' });
@@ -495,7 +571,7 @@ const server = http.createServer((request, response) => {
       stage: job.stage,
       message: job.message,
       next: job.state === 'ready' ? resultUrl(job) : undefined,
-      ahead: job.state === 'pending' && job.stage === 'queued' ? conversionsAhead() : 0,
+      ahead: job.state !== 'pending' ? 0 : job.stage === 'queued' ? convertPool.ahead() : job.stage === 'waitdownload' ? downloadPool.ahead() : 0,
       elapsedSeconds: job.startedAt ? Math.round((Date.now() - job.startedAt) / 1000) : 0,
       receivedBytes: job.receivedBytes || 0,
       totalBytes: job.totalBytes || 0,
@@ -550,7 +626,7 @@ async function warmUpConverter() {
   const samplePath = path.join(directory, 'warmup.txt');
   await fsp.writeFile(samplePath, 'warmup\n');
   for (let index = 0; index < convertConcurrency; index++) {
-    const slot = await acquireProfileSlot();
+    const slot = await convertPool.acquire({ priority: 'high' });
     const startedAt = Date.now();
     try {
       await convertToPdf(samplePath, directory, slot);
@@ -558,7 +634,7 @@ async function warmUpConverter() {
     } catch (error) {
       log('', `khởi động sẵn LibreOffice không thành công: ${error.message}`);
     } finally {
-      releaseProfileSlot(slot);
+      convertPool.release(slot);
     }
   }
   await fsp.rm(directory, { recursive: true, force: true });
